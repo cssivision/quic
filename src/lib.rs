@@ -1,7 +1,8 @@
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
-    }
+pub mod client;
+pub mod server;
+
+use std::io;
+
+fn other(msg: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, msg)
 }
