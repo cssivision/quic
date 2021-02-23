@@ -5,7 +5,9 @@ authors = ["cssivision <cssivision@gmail.com>"]
 edition = "2018"
 
 [dependencies]
-quiche = "0.6"
+quiche = "0.7"
 tokio = { version = "1.2", features = ["full"] }
 bytes = "1.0"
 ring = "0.16"
+anyhow = "1.0"
+log = "0.4"
