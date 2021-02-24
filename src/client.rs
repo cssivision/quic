@@ -1,9 +1,13 @@
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
+use futures::future::poll_fn;
 use ring::rand::*;
 use tokio::net::UdpSocket;
+use tokio::time::Sleep;
 
 use super::other;
 
@@ -12,7 +16,8 @@ const MAX_DATAGRAM_SIZE: usize = 1350;
 pub struct Connection {
     io: UdpSocket,
     conn: Pin<Box<quiche::Connection>>,
-    buf: [u8; MAX_DATAGRAM_SIZE],
+    recv_buf: [u8; 65535],
+    send_buf: [u8; MAX_DATAGRAM_SIZE],
 }
 
 pub async fn handshake(
@@ -26,28 +31,29 @@ pub async fn handshake(
     let mut conn =
         quiche::connect(server_name, &scid, &mut config).map_err(|e| other(&e.to_string()))?;
 
-    let mut buf = [0u8; MAX_DATAGRAM_SIZE];
-    let write = conn.send(&mut buf).map_err(|e| other(&e.to_string()))?;
+    let mut send_buf = [0u8; MAX_DATAGRAM_SIZE];
+    let write = conn
+        .send(&mut send_buf)
+        .map_err(|e| other(&e.to_string()))?;
+
     log::info!(
         "connecting from {:} with scid {:?}",
         io.local_addr().unwrap(),
         scid,
     );
 
-    let written = io.send(&buf[0..write]).await?;
+    let written = io.send(&send_buf[0..write]).await?;
     log::info!("written len: {}", written);
+    let recv_buf = [0u8; 65535];
 
-    conn.timeout();
+    if let Some(timeout) = conn.timeout() {}
 
-    /*
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(conn.timeout().unwrap());
-        }
-    });
-    */
-
-    Ok(Connection { io, conn, buf })
+    Ok(Connection {
+        io,
+        conn,
+        send_buf,
+        recv_buf,
+    })
 }
 
 fn generate_scid() -> io::Result<[u8; quiche::MAX_CONN_ID_LEN]> {
@@ -59,3 +65,19 @@ fn generate_scid() -> io::Result<[u8; quiche::MAX_CONN_ID_LEN]> {
 
     Ok(scid)
 }
+
+impl Future for Connection {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().poll(cx)
+    }
+}
+
+impl Connection {
+    fn poll(&mut self, cx: &mut Context) -> Poll<()> {
+        Poll::Ready(())
+    }
+}
+
+pub struct Stream {}
