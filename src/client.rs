@@ -18,6 +18,7 @@ pub struct Connection {
     conn: Pin<Box<quiche::Connection>>,
     recv_buf: [u8; 65535],
     send_buf: [u8; MAX_DATAGRAM_SIZE],
+    sleep: Option<Pin<Box<Sleep>>>,
 }
 
 pub async fn handshake(
@@ -53,6 +54,7 @@ pub async fn handshake(
         conn,
         send_buf,
         recv_buf,
+        sleep: None,
     })
 }
 
@@ -67,16 +69,16 @@ fn generate_scid() -> io::Result<[u8; quiche::MAX_CONN_ID_LEN]> {
 }
 
 impl Future for Connection {
-    type Output = ();
+    type Output = io::Result<()>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.get_mut().poll(cx)
     }
 }
 
 impl Connection {
-    fn poll(&mut self, cx: &mut Context) -> Poll<()> {
-        Poll::Ready(())
+    fn poll(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 }
 
