@@ -35,7 +35,6 @@ pub async fn new_connection(
         sleep: None,
         action: Arc::new(Mutex::new(action)),
         send_buf: BytesMut::with_capacity(MAX_DATAGRAM_SIZE),
-        recv_buf: BytesMut::with_capacity(65535),
     })
 }
 
@@ -63,7 +62,6 @@ pub struct Connection {
     sleep: Option<Pin<Box<Sleep>>>,
     action: Arc<Mutex<Action>>,
     send_buf: BytesMut,
-    recv_buf: BytesMut,
 }
 
 struct Action {
@@ -163,13 +161,11 @@ impl Connection {
         loop {
             match ready!(Pin::new(&mut self.io).poll_next(cx)) {
                 Some(v) => match v {
-                    Ok(v) => {
-                        self.recv_buf.put(v);
+                    Ok(mut buf) => {
+                        while !buf.is_empty() {
+                            let length = buf.len();
 
-                        while !self.recv_buf.is_empty() {
-                            let length = self.recv_buf.len();
-
-                            let read = match self.conn.recv(&mut self.recv_buf[..length]) {
+                            let read = match self.conn.recv(&mut buf[..length]) {
                                 Ok(v) => v,
 
                                 Err(e) => {
@@ -179,7 +175,7 @@ impl Connection {
                                 }
                             };
 
-                            self.recv_buf.advance(read);
+                            buf.advance(read);
                         }
                     }
                     Err(e) => {
