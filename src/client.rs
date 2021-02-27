@@ -1,10 +1,14 @@
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
+use crate::frame::IoConnection;
+
 use futures::future::poll_fn;
+use parking_lot::Mutex;
 use ring::rand::*;
 use tokio::net::UdpSocket;
 use tokio::time::Sleep;
@@ -13,15 +17,7 @@ use super::other;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
-pub struct Connection {
-    io: UdpSocket,
-    conn: Pin<Box<quiche::Connection>>,
-    recv_buf: [u8; 65535],
-    send_buf: [u8; MAX_DATAGRAM_SIZE],
-    sleep: Option<Pin<Box<Sleep>>>,
-}
-
-pub async fn handshake(
+pub async fn new_connection(
     io: UdpSocket,
     server_name: Option<&str>,
     mut config: quiche::Config,
@@ -29,31 +25,12 @@ pub async fn handshake(
     let scid = generate_scid()?;
     let scid = quiche::ConnectionId::from_ref(&scid);
 
-    let mut conn =
+    let conn =
         quiche::connect(server_name, &scid, &mut config).map_err(|e| other(&e.to_string()))?;
-
-    let mut send_buf = [0u8; MAX_DATAGRAM_SIZE];
-    let write = conn
-        .send(&mut send_buf)
-        .map_err(|e| other(&e.to_string()))?;
-
-    log::info!(
-        "connecting from {:} with scid {:?}",
-        io.local_addr().unwrap(),
-        scid,
-    );
-
-    let written = io.send(&send_buf[0..write]).await?;
-    log::info!("written len: {}", written);
-    let recv_buf = [0u8; 65535];
-
-    if let Some(timeout) = conn.timeout() {}
 
     Ok(Connection {
         io,
         conn,
-        send_buf,
-        recv_buf,
         sleep: None,
     })
 }
@@ -76,8 +53,80 @@ impl Future for Connection {
     }
 }
 
+pub struct Connection {
+    io: UdpSocket,
+    conn: Pin<Box<quiche::Connection>>,
+    sleep: Option<Pin<Box<Sleep>>>,
+    actions: Arc<Mutex<Action>>,
+}
+
+struct Action {
+    waker: Option<Waker>,
+}
+
 impl Connection {
     fn poll(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        match ready!(self.poll_send(cx)) {
+            Ok(()) => match ready!(self.poll_recv(cx)) {
+                Ok(()) => Poll::Ready(Ok(())),
+                Err(e) => {
+                    log::error!("poll_recv error: {:?}", e);
+                    Poll::Ready(Err(e))
+                }
+            },
+            Err(e) => {
+                log::error!("poll_send error: {:?}", e);
+                Poll::Ready(Err(e))
+            }
+        }
+    }
+
+    fn poll_timeout(&mut self, cx: &mut Context) {}
+
+    fn poll_send(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        let write = match self.conn.send(&mut self.send_buf) {
+            Ok(v) => v,
+            Err(quiche::Error::Done) => {
+                // Done writing.
+            }
+            Err(e) => {
+                // An error occurred, handle it.
+            }
+        };
+
+        self.io.poll_send(&self.send_buf[..write]);
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_recv(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        let mut sink = Pin::new(&mut self.transport);
+        let mut actions = self.actions.lock();
+
+        let mut try_send = false;
+
+        while let Ok(res) = self.buffer.pop() {
+            match sink.as_mut().poll_ready(cx)? {
+                Poll::Ready(()) => {
+                    try_send = true;
+                    sink.as_mut().start_send(res)?;
+                }
+                Poll::Pending => {
+                    // If we've got an item already, we need to write it back to the buffer
+                    let _ = self.buffer.push(res);
+                    if try_send {
+                        ready!(sink.poll_flush(cx))?;
+                    }
+                    return Poll::Pending;
+                }
+            }
+        }
+
+        if try_send {
+            ready!(sink.poll_flush(cx))?;
+        }
+
+        actions.waker = Some(cx.waker().clone());
+
         Poll::Ready(Ok(()))
     }
 }

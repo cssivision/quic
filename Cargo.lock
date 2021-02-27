@@ -348,9 +348,11 @@ dependencies = [
  "bytes",
  "futures",
  "log",
+ "parking_lot",
  "quiche",
  "ring",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -483,6 +485,20 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tokio-util"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ebb7cb2f00c5ae8df755b252306272cd1790d39728363936e01827e11f0b017b"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "futures-sink",
+ "log",
+ "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]
