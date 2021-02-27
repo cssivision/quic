@@ -3,13 +3,13 @@ use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
-use std::time::Duration;
 
-use crate::frame::IoConnection;
+use crate::io_connection::IoConnection;
 
-use futures::future::poll_fn;
+use bytes::{Buf, BufMut, BytesMut};
+use futures::{future::poll_fn, Sink, Stream};
 use parking_lot::Mutex;
-use ring::rand::*;
+use ring::rand::{SecureRandom, SystemRandom};
 use tokio::net::UdpSocket;
 use tokio::time::Sleep;
 
@@ -28,10 +28,14 @@ pub async fn new_connection(
     let conn =
         quiche::connect(server_name, &scid, &mut config).map_err(|e| other(&e.to_string()))?;
 
+    let action = Action { waker: None };
     Ok(Connection {
-        io,
         conn,
+        io: IoConnection::new(io),
         sleep: None,
+        action: Arc::new(Mutex::new(action)),
+        send_buf: BytesMut::with_capacity(MAX_DATAGRAM_SIZE),
+        recv_buf: BytesMut::with_capacity(65535),
     })
 }
 
@@ -54,10 +58,12 @@ impl Future for Connection {
 }
 
 pub struct Connection {
-    io: UdpSocket,
     conn: Pin<Box<quiche::Connection>>,
+    io: IoConnection,
     sleep: Option<Pin<Box<Sleep>>>,
-    actions: Arc<Mutex<Action>>,
+    action: Arc<Mutex<Action>>,
+    send_buf: BytesMut,
+    recv_buf: BytesMut,
 }
 
 struct Action {
@@ -65,6 +71,19 @@ struct Action {
 }
 
 impl Connection {
+    async fn main_loop(&mut self) {
+        poll_fn(|cx| {
+            match self.poll_recv(cx) {
+                Poll::Ready(Err(e)) => {}
+                Poll::Ready(Ok(_)) => panic!("unexpeted branch"),
+                Poll::Pending => if let Err(e) = ready!(self.poll_send(cx)) {},
+            }
+
+            Poll::Pending
+        })
+        .await
+    }
+
     fn poll(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
         match ready!(self.poll_send(cx)) {
             Ok(()) => match ready!(self.poll_recv(cx)) {
@@ -81,42 +100,54 @@ impl Connection {
         }
     }
 
-    fn poll_timeout(&mut self, cx: &mut Context) {}
-
-    fn poll_send(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
-        let write = match self.conn.send(&mut self.send_buf) {
-            Ok(v) => v,
-            Err(quiche::Error::Done) => {
-                // Done writing.
+    fn poll_timeout(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        if let Some(mut sleep) = self.sleep.as_mut() {
+            match Pin::new(&mut sleep).poll(cx) {
+                Poll::Pending => {}
+                Poll::Ready(_) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "connection timeout",
+                    )));
+                }
             }
-            Err(e) => {
-                // An error occurred, handle it.
-            }
-        };
+        }
 
-        self.io.poll_send(&self.send_buf[..write]);
         Poll::Ready(Ok(()))
     }
 
-    fn poll_recv(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
-        let mut sink = Pin::new(&mut self.transport);
-        let mut actions = self.actions.lock();
-
+    fn poll_send(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        let mut sink = Pin::new(&mut self.io);
+        let mut action = self.action.lock();
         let mut try_send = false;
 
-        while let Ok(res) = self.buffer.pop() {
-            match sink.as_mut().poll_ready(cx)? {
-                Poll::Ready(()) => {
-                    try_send = true;
-                    sink.as_mut().start_send(res)?;
-                }
-                Poll::Pending => {
-                    // If we've got an item already, we need to write it back to the buffer
-                    let _ = self.buffer.push(res);
-                    if try_send {
-                        ready!(sink.poll_flush(cx))?;
+        loop {
+            let send_buf = if self.send_buf.is_empty() {
+                self.conn.send(&mut self.send_buf)
+            } else {
+                Ok(self.send_buf.len())
+            };
+
+            match send_buf {
+                Ok(v) => match sink.as_mut().poll_ready(cx)? {
+                    Poll::Ready(()) => {
+                        try_send = true;
+                        sink.as_mut().start_send(self.send_buf.split_to(v))?;
+                        self.send_buf.clear();
                     }
-                    return Poll::Pending;
+                    Poll::Pending => {
+                        if try_send {
+                            ready!(sink.poll_flush(cx))?;
+                        }
+                        return Poll::Pending;
+                    }
+                },
+                Err(quiche::Error::Done) => {
+                    break;
+                }
+                Err(e) => {
+                    log::error!("quiche conn send error: {:?}", e);
+                    return Poll::Ready(Err(other(&e.to_string())));
                 }
             }
         }
@@ -124,11 +155,44 @@ impl Connection {
         if try_send {
             ready!(sink.poll_flush(cx))?;
         }
-
-        actions.waker = Some(cx.waker().clone());
-
+        action.waker = Some(cx.waker().clone());
         Poll::Ready(Ok(()))
     }
-}
 
-pub struct Stream {}
+    fn poll_recv(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        loop {
+            match ready!(Pin::new(&mut self.io).poll_next(cx)) {
+                Some(v) => match v {
+                    Ok(v) => {
+                        self.recv_buf.put(v);
+
+                        while !self.recv_buf.is_empty() {
+                            let length = self.recv_buf.len();
+
+                            let read = match self.conn.recv(&mut self.recv_buf[..length]) {
+                                Ok(v) => v,
+
+                                Err(e) => {
+                                    // An error occurred, handle it.
+                                    log::error!("quiche recv err: {:?}", e);
+                                    break;
+                                }
+                            };
+
+                            self.recv_buf.advance(read);
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("poll_recv err: {}", e.to_string());
+                        return Poll::Ready(Err(e));
+                    }
+                },
+                None => {
+                    log::error!("poll_recv recv eof");
+                    let e = io::Error::new(io::ErrorKind::UnexpectedEof, "eof");
+                    return Poll::Ready(Err(e));
+                }
+            }
+        }
+    }
+}

@@ -8,7 +8,7 @@ macro_rules! ready {
 }
 
 pub mod client;
-mod frame;
+mod io_connection;
 pub mod server;
 
 use std::io;
