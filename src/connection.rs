@@ -19,7 +19,7 @@ const MAX_DATAGRAM_SIZE: usize = 1350;
 impl Future for Connection {
     type Output = io::Result<()>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
         self.get_mut().poll(cx)
     }
 }
@@ -35,7 +35,15 @@ pub struct Connection {
     inner: Arc<Mutex<Inner>>,
 }
 
-struct Inner {}
+struct Inner {
+    streams: HashMap<u64, QStream>,
+}
+
+struct QStream {
+    waker: Option<Waker>,
+    data: BytesMut,
+    fin: bool,
+}
 
 struct Action {
     waker: Option<Waker>,
@@ -44,7 +52,9 @@ struct Action {
 impl Connection {
     pub fn new(io: UdpSocket, conn: Pin<Box<quiche::Connection>>) -> Connection {
         let action = Action { waker: None };
-        let inner = Inner {};
+        let inner = Inner {
+            streams: HashMap::new(),
+        };
 
         Connection {
             conn,
@@ -156,14 +166,38 @@ impl Connection {
         Poll::Ready(Ok(()))
     }
 
-    fn handle_streams(&mut self) {
-        if self.conn.is_readable() {
-            for s in self.conn.readable() {
-                let mut buf = BytesMut::new();
-                while let Ok((read, fin)) = self.conn.stream_recv(s, &mut self.recv_buf) {
-                    log::debug!("stream {} has {} bytes (fin? {})", s, read, fin);
+    fn recv_streams(&mut self) {
+        if !self.conn.is_readable() {
+            return;
+        }
+
+        let mut m = HashMap::new();
+        for id in self.conn.readable() {
+            let mut buf = BytesMut::new();
+            let mut finish = false;
+            while let Ok((read, fin)) = self.conn.stream_recv(id, &mut self.recv_buf) {
+                log::debug!("stream {} has {} bytes (fin? {})", id, read, fin);
+                buf.put(self.recv_buf.split_to(read));
+                self.recv_buf.reserve(65535);
+                finish = fin;
+            }
+            m.insert(id, (buf, finish));
+        }
+
+        let mut wakers = vec![];
+        let mut inner = self.inner.lock();
+        for (id, (buf, fin)) in m.into_iter() {
+            if let Some(s) = inner.streams.get_mut(&id) {
+                s.data.put(buf);
+                s.fin = fin;
+                if let Some(waker) = s.waker.take() {
+                    wakers.push(waker);
                 }
             }
+        }
+
+        for waker in wakers {
+            waker.wake();
         }
     }
 
@@ -185,7 +219,7 @@ impl Connection {
                             buf.advance(read);
                         }
 
-                        self.handle_streams();
+                        self.recv_streams();
                     }
                     Err(e) => {
                         log::error!("poll_recv err: {}", e.to_string());
