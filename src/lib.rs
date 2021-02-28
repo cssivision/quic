@@ -8,6 +8,7 @@ macro_rules! ready {
 }
 
 pub mod client;
+pub mod connection;
 mod io_connection;
 pub mod server;
 
