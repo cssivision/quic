@@ -46,7 +46,7 @@ impl Stream for IoConnection {
                 let buf = &mut *(pin.rd.chunk_mut() as *mut _ as *mut [MaybeUninit<u8>]);
                 let mut read = ReadBuf::uninit(buf);
                 let ptr = read.filled().as_ptr();
-                let res = ready!(Pin::new(&mut pin.socket).poll_recv(cx, &mut read));
+                ready!(Pin::new(&mut pin.socket).poll_recv(cx, &mut read))?;
 
                 assert_eq!(ptr, read.filled().as_ptr());
                 pin.rd.advance_mut(read.filled().len());
@@ -128,15 +128,5 @@ impl IoConnection {
             flushed: true,
             is_readable: false,
         }
-    }
-
-    pub fn reset_readable(&mut self) {
-        self.rd.clear();
-        self.is_readable = false;
-    }
-
-    pub fn reset_writable(&mut self) {
-        self.wr.clear();
-        self.flushed = true;
     }
 }
