@@ -1,14 +1,21 @@
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
-use std::{collections::HashMap, io};
-use std::{future::Future, sync::atomic::AtomicU64};
+use std::{
+    collections::HashMap,
+    future::Future,
+    io,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 use crate::io_connection::IoConnection;
 
 use bytes::{Buf, BufMut, BytesMut};
 use futures::{Sink, Stream};
 use parking_lot::Mutex;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
 use tokio::time::{sleep, Instant, Sleep};
 
@@ -31,15 +38,29 @@ pub struct Connection {
     action: Arc<Mutex<Action>>,
     send_buf: BytesMut,
     recv_buf: BytesMut,
-    id_generator: AtomicU64,
     inner: Arc<Mutex<Inner>>,
 }
 
 struct Inner {
-    streams: HashMap<u64, QStream>,
+    streams: HashMap<u64, Arc<Mutex<QStreamInner>>>,
 }
 
-struct QStream {
+pub struct QStream {
+    id: u64,
+    inner: Arc<Mutex<QStreamInner>>,
+}
+
+impl QStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        unimplemented!();
+    }
+}
+
+struct QStreamInner {
     waker: Option<Waker>,
     data: BytesMut,
     fin: bool,
@@ -49,23 +70,52 @@ struct Action {
     waker: Option<Waker>,
 }
 
-impl Connection {
-    pub fn new(io: UdpSocket, conn: Pin<Box<quiche::Connection>>) -> Connection {
-        let action = Action { waker: None };
-        let inner = Inner {
-            streams: HashMap::new(),
-        };
+pub struct Streams {
+    inner: Arc<Mutex<Inner>>,
+    id_generator: AtomicU64,
+}
 
-        Connection {
+impl Streams {
+    pub fn new(&mut self) -> QStream {
+        let id = self
+            .id_generator
+            .fetch_add(10, Ordering::SeqCst)
+            .wrapping_add(1);
+
+        let inner = Arc::new(Mutex::new(QStreamInner {
+            waker: None,
+            data: BytesMut::new(),
+            fin: false,
+        }));
+
+        self.inner.lock().streams.insert(id, inner.clone());
+        QStream { inner, id }
+    }
+}
+
+impl Connection {
+    pub fn new(io: UdpSocket, conn: Pin<Box<quiche::Connection>>) -> (Connection, Streams) {
+        let action = Action { waker: None };
+        let inner = Arc::new(Mutex::new(Inner {
+            streams: HashMap::new(),
+        }));
+
+        let conn = Connection {
             conn,
             io: IoConnection::new(io),
             sleep: None,
             action: Arc::new(Mutex::new(action)),
             send_buf: BytesMut::with_capacity(MAX_DATAGRAM_SIZE),
             recv_buf: BytesMut::with_capacity(65535),
-            inner: Arc::new(Mutex::new(inner)),
+            inner: inner.clone(),
+        };
+
+        let streams = Streams {
+            inner,
             id_generator: AtomicU64::new(0),
-        }
+        };
+
+        (conn, streams)
     }
 
     fn timeout(&mut self) {
@@ -187,7 +237,8 @@ impl Connection {
         let mut wakers = vec![];
         let mut inner = self.inner.lock();
         for (id, (buf, fin)) in m.into_iter() {
-            if let Some(s) = inner.streams.get_mut(&id) {
+            if let Some(qs) = inner.streams.get_mut(&id) {
+                let mut s = qs.lock();
                 s.data.put(buf);
                 s.fin = fin;
                 if let Some(waker) = s.waker.take() {

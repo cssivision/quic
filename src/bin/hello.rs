@@ -24,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
     let sock = UdpSocket::bind("0.0.0.0:0").await?;
     sock.connect("127.0.0.1:8081").await?;
 
-    let conn = quic::client::new_connection(sock, Some("quic.tech"), config);
+    let (conn, streams) = quic::client::connect(sock, Some("quic.tech"), config)?;
 
     Ok(())
 }
