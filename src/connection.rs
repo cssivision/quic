@@ -48,15 +48,31 @@ struct Inner {
 pub struct QStream {
     id: u64,
     inner: Arc<Mutex<QStreamInner>>,
+    conn: Arc<Mutex<Inner>>,
 }
 
-impl QStream {
+impl Drop for QStream {
+    fn drop(&mut self) {
+        self.conn.lock().streams.remove(&self.id);
+    }
+}
+
+impl AsyncRead for QStream {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        unimplemented!();
+        let mut inner = self.inner.lock();
+        if !inner.data.is_empty() {
+            buf.put_slice(&inner.data.split());
+            return Poll::Ready(Ok(()));
+        }
+        if inner.fin {
+            return Poll::Ready(Ok(()));
+        }
+        inner.waker = Some(cx.waker().clone());
+        Poll::Pending
     }
 }
 
@@ -89,7 +105,11 @@ impl Streams {
         }));
 
         self.inner.lock().streams.insert(id, inner.clone());
-        QStream { inner, id }
+        QStream {
+            inner,
+            id,
+            conn: self.inner.clone(),
+        }
     }
 }
 
