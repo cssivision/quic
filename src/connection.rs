@@ -1,18 +1,15 @@
+use std::collections::HashMap;
+use std::future::Future;
+use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
-use std::{
-    collections::HashMap,
-    future::Future,
-    io,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-};
 
 use crate::io_connection::IoConnection;
 
 use bytes::{Buf, BufMut, BytesMut};
+use concurrent_queue::ConcurrentQueue;
 use futures::{Sink, Stream};
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -35,25 +32,36 @@ pub struct Connection {
     conn: Pin<Box<quiche::Connection>>,
     io: IoConnection,
     sleep: Option<Pin<Box<Sleep>>>,
-    action: Arc<Mutex<Action>>,
     send_buf: BytesMut,
     recv_buf: BytesMut,
-    inner: Arc<Mutex<Inner>>,
+    inner: Arc<Inner>,
 }
 
-struct Inner {
-    streams: HashMap<u64, Arc<Mutex<QStreamInner>>>,
+struct QData {
+    id: u64,
+    data: Option<Vec<u8>>,
+    fin: bool,
+}
+
+struct Action {
+    waker: Option<Waker>,
+}
+
+struct QStreamInner {
+    waker: Option<Waker>,
+    data: BytesMut,
+    fin: bool,
 }
 
 pub struct QStream {
     id: u64,
     inner: Arc<Mutex<QStreamInner>>,
-    conn: Arc<Mutex<Inner>>,
+    streams: Streams,
 }
 
 impl Drop for QStream {
     fn drop(&mut self) {
-        self.conn.lock().streams.remove(&self.id);
+        self.streams.0.stores.lock().remove(&self.id);
     }
 }
 
@@ -76,24 +84,68 @@ impl AsyncRead for QStream {
     }
 }
 
-struct QStreamInner {
-    waker: Option<Waker>,
-    data: BytesMut,
-    fin: bool,
+impl AsyncWrite for QStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        let _ = self.streams.0.queue.push(QData {
+            data: Some(buf.to_vec()),
+            id: self.id,
+            fin: false,
+        });
+
+        self.streams.0.wake();
+
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        let _ = self.streams.0.queue.push(QData {
+            data: None,
+            id: self.id,
+            fin: true,
+        });
+
+        self.streams.0.wake();
+
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        Poll::Ready(Ok(()))
+    }
 }
 
-struct Action {
-    waker: Option<Waker>,
-}
-
-pub struct Streams {
-    inner: Arc<Mutex<Inner>>,
+pub struct Inner {
+    stores: Arc<Mutex<HashMap<u64, Arc<Mutex<QStreamInner>>>>>,
     id_generator: AtomicU64,
+    queue: Arc<ConcurrentQueue<QData>>,
+    action: Arc<Mutex<Action>>,
+}
+
+impl Inner {
+    fn wake(&self) {
+        let mut action = self.action.lock();
+        if let Some(waker) = action.waker.take() {
+            waker.wake();
+        }
+    }
+}
+
+pub struct Streams(Arc<Inner>);
+
+impl Clone for Streams {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
 }
 
 impl Streams {
-    pub fn new(&mut self) -> QStream {
+    pub fn new(&self) -> QStream {
         let id = self
+            .0
             .id_generator
             .fetch_add(10, Ordering::SeqCst)
             .wrapping_add(1);
@@ -104,11 +156,11 @@ impl Streams {
             fin: false,
         }));
 
-        self.inner.lock().streams.insert(id, inner.clone());
+        self.0.stores.lock().insert(id, inner.clone());
         QStream {
             inner,
             id,
-            conn: self.inner.clone(),
+            streams: self.clone(),
         }
     }
 }
@@ -116,26 +168,27 @@ impl Streams {
 impl Connection {
     pub fn new(io: UdpSocket, conn: Pin<Box<quiche::Connection>>) -> (Connection, Streams) {
         let action = Action { waker: None };
-        let inner = Arc::new(Mutex::new(Inner {
-            streams: HashMap::new(),
-        }));
+
+        let queue = Arc::new(ConcurrentQueue::unbounded());
+        let action = Arc::new(Mutex::new(action));
+
+        let inner = Arc::new(Inner {
+            stores: Arc::new(Mutex::new(HashMap::new())),
+            id_generator: AtomicU64::new(0),
+            queue,
+            action,
+        });
 
         let conn = Connection {
             conn,
             io: IoConnection::new(io),
             sleep: None,
-            action: Arc::new(Mutex::new(action)),
             send_buf: BytesMut::with_capacity(MAX_DATAGRAM_SIZE),
             recv_buf: BytesMut::with_capacity(65535),
             inner: inner.clone(),
         };
 
-        let streams = Streams {
-            inner,
-            id_generator: AtomicU64::new(0),
-        };
-
-        (conn, streams)
+        (conn, Streams(inner))
     }
 
     fn timeout(&mut self) {
@@ -195,8 +248,14 @@ impl Connection {
 
     fn poll_send(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
         let mut sink = Pin::new(&mut self.io);
-        let mut action = self.action.lock();
+        let mut action = self.inner.action.lock();
         let mut try_send = false;
+
+        while let Ok(data) = self.inner.queue.pop() {
+            let _ = self
+                .conn
+                .stream_send(data.id, &data.data.unwrap_or_default(), data.fin);
+        }
 
         loop {
             let size = if self.send_buf.is_empty() {
@@ -255,9 +314,9 @@ impl Connection {
         }
 
         let mut wakers = vec![];
-        let mut inner = self.inner.lock();
+        let mut stores = self.inner.stores.lock();
         for (id, (buf, fin)) in m.into_iter() {
-            if let Some(qs) = inner.streams.get_mut(&id) {
+            if let Some(qs) = stores.get_mut(&id) {
                 let mut s = qs.lock();
                 s.data.put(buf);
                 s.fin = fin;
