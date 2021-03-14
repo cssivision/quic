@@ -25,6 +25,8 @@ async fn main() -> anyhow::Result<()> {
     sock.connect("127.0.0.1:8081").await?;
 
     let (conn, streams) = quic::client::connect(sock, Some("quic.tech"), config)?;
+    tokio::spawn(async move { conn.await });
+    streams.ready().await?;
 
     Ok(())
 }

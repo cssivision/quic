@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
+use std::mem;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
@@ -10,6 +11,7 @@ use crate::io_connection::IoConnection;
 
 use bytes::{Buf, BufMut, BytesMut};
 use concurrent_queue::ConcurrentQueue;
+use futures::future::poll_fn;
 use futures::{Sink, Stream};
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -123,6 +125,35 @@ pub struct Inner {
     id_generator: AtomicU64,
     queue: Arc<ConcurrentQueue<QData>>,
     action: Arc<Mutex<Action>>,
+    ready: Ready,
+}
+
+struct Ready {
+    is_ready: AtomicBool,
+    inner: Mutex<ReadyInner>,
+}
+
+struct ReadyInner {
+    waker: Option<Waker>,
+    error: Option<io::Result<()>>,
+}
+
+impl Ready {
+    fn wake(&self) {
+        if let Some(waker) = self.inner.lock().waker.take() {
+            waker.wake();
+        }
+    }
+
+    fn new() -> Ready {
+        Ready {
+            inner: Mutex::new(ReadyInner {
+                waker: None,
+                error: None,
+            }),
+            is_ready: AtomicBool::new(false),
+        }
+    }
 }
 
 impl Inner {
@@ -131,6 +162,19 @@ impl Inner {
         if let Some(waker) = action.waker.take() {
             waker.wake();
         }
+    }
+
+    fn ready(&self, cx: &Context) -> Poll<io::Result<()>> {
+        if self.ready.is_ready.load(Ordering::SeqCst) {
+            return Poll::Ready(Ok(()));
+        }
+        let mut inner = self.ready.inner.lock();
+        if let Some(e) = inner.error.take() {
+            return Poll::Ready(e);
+        }
+        let _ = mem::replace(&mut inner.waker, Some(cx.waker().clone()));
+
+        Poll::Pending
     }
 }
 
@@ -163,20 +207,20 @@ impl Streams {
             streams: self.clone(),
         }
     }
+
+    pub async fn ready(&self) -> io::Result<()> {
+        poll_fn(|cx| self.0.ready(cx)).await
+    }
 }
 
 impl Connection {
     pub fn new(io: UdpSocket, conn: Pin<Box<quiche::Connection>>) -> (Connection, Streams) {
-        let action = Action { waker: None };
-
-        let queue = Arc::new(ConcurrentQueue::unbounded());
-        let action = Arc::new(Mutex::new(action));
-
         let inner = Arc::new(Inner {
+            ready: Ready::new(),
             stores: Arc::new(Mutex::new(HashMap::new())),
             id_generator: AtomicU64::new(0),
-            queue,
-            action,
+            queue: Arc::new(ConcurrentQueue::unbounded()),
+            action: Arc::new(Mutex::new(Action { waker: None })),
         });
 
         let conn = Connection {
@@ -208,19 +252,28 @@ impl Connection {
         }
     }
 
+    fn recv_error(&self, e: &io::Error) {
+        let _ = mem::replace(
+            &mut self.inner.ready.inner.lock().error,
+            Some(Err(other(&e.to_string()))),
+        );
+    }
+
     fn poll(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
         match self.poll_recv(cx) {
             Poll::Ready(Err(e)) => {
                 log::error!("poll_recv error: {:?}", e);
+                self.recv_error(&e);
+                return Poll::Ready(Err(e));
             }
             Poll::Ready(Ok(_)) => panic!("unexpeted branch"),
             Poll::Pending => {
                 self.timeout();
-
                 if let Err(e) = ready!(self.poll_send(cx)) {
                     log::error!("poll_send error: {:?}", e);
+                    self.recv_error(&e);
+                    return Poll::Ready(Err(e));
                 }
-
                 if let Poll::Ready(Err(_)) = self.poll_timeout(cx) {
                     self.conn.on_timeout();
                 }
@@ -331,6 +384,13 @@ impl Connection {
         }
     }
 
+    fn ready(&self) {
+        if self.conn.is_established() {
+            self.inner.ready.is_ready.store(true, Ordering::SeqCst);
+            self.inner.ready.wake();
+        }
+    }
+
     fn poll_recv(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
         loop {
             match ready!(Pin::new(&mut self.io).poll_next(cx)) {
@@ -345,11 +405,8 @@ impl Connection {
                                     break;
                                 }
                             };
-
                             buf.advance(read);
                         }
-
-                        self.recv_streams();
                     }
                     Err(e) => {
                         log::error!("poll_recv err: {}", e.to_string());
@@ -362,6 +419,16 @@ impl Connection {
                     return Poll::Ready(Err(e));
                 }
             }
+
+            if self.conn.is_closed() {
+                return Poll::Ready(Err(other(&format!(
+                    "connection closed, {:?}",
+                    self.conn.stats()
+                ))));
+            }
+
+            self.recv_streams();
+            self.ready();
         }
     }
 }
