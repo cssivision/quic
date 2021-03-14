@@ -311,6 +311,7 @@ impl Connection {
         }
 
         loop {
+            log::debug!("{}", self.send_buf.len());
             let size = if self.send_buf.is_empty() {
                 self.conn.send(&mut self.send_buf)
             } else {

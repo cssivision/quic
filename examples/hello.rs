@@ -1,9 +1,12 @@
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    env_logger::init();
+
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
     config.verify_peer(false);
 
@@ -24,9 +27,21 @@ async fn main() -> anyhow::Result<()> {
     let sock = UdpSocket::bind("0.0.0.0:0").await?;
     sock.connect("127.0.0.1:8081").await?;
 
-    let (conn, streams) = quic::client::connect(sock, Some("quic.tech"), config)?;
+    let url = url::Url::parse("https://cloudflare-quic.com/").unwrap();
+    let req = format!("GET {}\r\n", url.path());
+
+    let (conn, streams) =
+        quic::client::connect(sock, Some("https://cloudflare-quic.com/"), config)?;
     tokio::spawn(async move { conn.await });
     streams.ready().await?;
+
+    let mut s = streams.new();
+
+    s.write_all(req.as_bytes()).await?;
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).await?;
+
+    log::debug!("rsp: {:?}", std::str::from_utf8(&buf));
 
     Ok(())
 }
