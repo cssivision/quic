@@ -365,6 +365,7 @@ impl Connection {
     }
 
     fn recv_streams(&mut self) {
+        log::debug!("is readable: {}", self.conn.is_readable());
         if !self.conn.is_readable() {
             return;
         }
@@ -419,12 +420,11 @@ impl Connection {
                                 Ok(v) => v,
                                 Err(e) => {
                                     log::error!("quiche recv err: {:?}", e);
-                                    break;
+                                    return Poll::Ready(Err(other(&e.to_string())));
                                 }
                             };
                             buf.advance(read);
                         }
-                        log::debug!("buf left: {:?}", buf.len());
                     }
                     Err(e) => {
                         log::error!("poll_recv err: {}", e.to_string());
@@ -438,6 +438,7 @@ impl Connection {
                 }
             }
 
+            log::debug!("is closed: {}", self.conn.is_closed());
             if self.conn.is_closed() {
                 log::debug!("quiche conn closed");
                 return Poll::Ready(Err(other(&format!(
