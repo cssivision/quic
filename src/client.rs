@@ -22,6 +22,7 @@ pub fn connect(
     mut config: quiche::Config,
 ) -> io::Result<(Connection, Streams)> {
     let scid = generate_scid()?;
+    log::debug!("scid: {:?}", scid);
     let scid = quiche::ConnectionId::from_ref(&scid);
 
     let conn =

@@ -241,6 +241,7 @@ impl Connection {
     fn timeout(&mut self) {
         match self.conn.timeout() {
             Some(timeout) => {
+                log::debug!("quiche timeout: {:?}", timeout);
                 if self.sleep.is_none() {
                     self.sleep = Some(Box::pin(sleep(timeout)));
                 } else {
@@ -251,7 +252,10 @@ impl Connection {
                         .reset(Instant::now() + timeout);
                 }
             }
-            None => self.sleep = None,
+            None => {
+                log::debug!("no timeout");
+                self.sleep = None
+            }
         }
     }
 
@@ -319,6 +323,8 @@ impl Connection {
             } else {
                 Ok(self.buf.len())
             };
+
+            log::debug!("send data {:?}", size);
 
             match size {
                 Ok(v) => match sink.as_mut().poll_ready(cx)? {
@@ -394,6 +400,7 @@ impl Connection {
     }
 
     fn ready(&self) {
+        log::debug!("is established: {}", self.conn.is_established());
         if self.conn.is_established() {
             self.inner.ready.is_ready.store(true, Ordering::SeqCst);
             self.inner.ready.wake();
@@ -405,6 +412,7 @@ impl Connection {
             match ready!(Pin::new(&mut self.io).poll_next(cx)) {
                 Some(buf) => match buf {
                     Ok(mut buf) => {
+                        log::debug!("recv data: {:?}", buf.len());
                         while !buf.is_empty() {
                             let length = buf.len();
                             let read = match self.conn.recv(&mut buf[..length]) {
@@ -416,6 +424,7 @@ impl Connection {
                             };
                             buf.advance(read);
                         }
+                        log::debug!("buf left: {:?}", buf.len());
                     }
                     Err(e) => {
                         log::error!("poll_recv err: {}", e.to_string());
@@ -430,6 +439,7 @@ impl Connection {
             }
 
             if self.conn.is_closed() {
+                log::debug!("quiche conn closed");
                 return Poll::Ready(Err(other(&format!(
                     "connection closed, {:?}",
                     self.conn.stats()

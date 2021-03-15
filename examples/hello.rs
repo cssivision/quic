@@ -1,3 +1,5 @@
+use std::net::ToSocketAddrs;
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 
@@ -25,15 +27,19 @@ async fn main() -> anyhow::Result<()> {
     config.set_disable_active_migration(true);
 
     let sock = UdpSocket::bind("0.0.0.0:0").await?;
-    sock.connect("127.0.0.1:8081").await?;
 
     let url = url::Url::parse("https://cloudflare-quic.com/").unwrap();
+    let peer_addr = url.to_socket_addrs().unwrap().next().unwrap();
+    log::debug!("connect peer addr:{:?}", peer_addr);
     let req = format!("GET {}\r\n", url.path());
 
+    sock.connect(peer_addr).await?;
     let (conn, streams) =
         quic::client::connect(sock, Some("https://cloudflare-quic.com/"), config)?;
     tokio::spawn(async move { conn.await });
     streams.ready().await?;
+
+    log::debug!("ready");
 
     let mut s = streams.new();
 
