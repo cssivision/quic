@@ -21,6 +21,7 @@ use tokio::time::{sleep, Instant, Sleep};
 use super::other;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
+const MAX_BUFFER_SIZE: usize = 65535;
 
 impl Future for Connection {
     type Output = io::Result<()>;
@@ -34,8 +35,9 @@ pub struct Connection {
     conn: Pin<Box<quiche::Connection>>,
     io: IoConnection,
     sleep: Option<Pin<Box<Sleep>>>,
-    send_buf: BytesMut,
-    recv_buf: BytesMut,
+    buf: BytesMut,
+    wr: Vec<u8>,
+    rd: Vec<u8>,
     inner: Arc<Inner>,
 }
 
@@ -227,8 +229,9 @@ impl Connection {
             conn,
             io: IoConnection::new(io),
             sleep: None,
-            send_buf: BytesMut::with_capacity(MAX_DATAGRAM_SIZE),
-            recv_buf: BytesMut::with_capacity(65535),
+            buf: BytesMut::with_capacity(MAX_DATAGRAM_SIZE),
+            wr: vec![0u8; MAX_DATAGRAM_SIZE],
+            rd: vec![0u8; MAX_BUFFER_SIZE],
             inner: inner.clone(),
         };
 
@@ -311,21 +314,27 @@ impl Connection {
         }
 
         loop {
-            log::debug!("{}", self.send_buf.len());
-            let size = if self.send_buf.is_empty() {
-                self.conn.send(&mut self.send_buf)
+            let size = if self.buf.is_empty() {
+                self.conn.send(&mut self.wr)
             } else {
-                Ok(self.send_buf.len())
+                Ok(self.buf.len())
             };
 
             match size {
                 Ok(v) => match sink.as_mut().poll_ready(cx)? {
                     Poll::Ready(()) => {
                         try_send = true;
-                        sink.as_mut().start_send(self.send_buf.split_to(v))?;
-                        self.send_buf.clear();
+                        if self.buf.is_empty() {
+                            self.buf.put_slice(&self.wr[0..v]);
+                        }
+                        sink.as_mut().start_send(self.buf.split())?;
+                        self.buf.reserve(MAX_DATAGRAM_SIZE);
                     }
                     Poll::Pending => {
+                        // got data already, we need to write it back to the buf
+                        if self.buf.is_empty() {
+                            self.buf.put_slice(&self.wr[0..v]);
+                        }
                         if try_send {
                             ready!(sink.poll_flush(cx))?;
                         }
@@ -358,10 +367,9 @@ impl Connection {
         for id in self.conn.readable() {
             let mut buf = BytesMut::new();
             let mut finish = false;
-            while let Ok((read, fin)) = self.conn.stream_recv(id, &mut self.recv_buf) {
+            while let Ok((read, fin)) = self.conn.stream_recv(id, &mut self.rd) {
                 log::debug!("stream {} has {} bytes (fin? {})", id, read, fin);
-                buf.put(self.recv_buf.split_to(read));
-                self.recv_buf.reserve(65535);
+                buf.put(&self.rd[0..read]);
                 finish = fin;
             }
             m.insert(id, (buf, finish));
