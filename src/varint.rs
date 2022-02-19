@@ -1,9 +1,13 @@
 use std::convert::{TryFrom, TryInto};
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
-pub struct VarInt(u64);
+pub struct VarInt(pub(crate) u64);
 
 impl VarInt {
+    pub unsafe fn from_u64_unchecked(x: u64) -> Self {
+        VarInt(x)
+    }
+
     pub fn from_u64(x: u64) -> Result<VarInt, VarIntExceeded> {
         if x < 2u64.pow(62) {
             Ok(VarInt(x))
