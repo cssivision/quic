@@ -1,4 +1,4 @@
-use std::convert::TryInto;
+use std::convert::{TryFrom, TryInto};
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
 pub struct VarInt(u64);
@@ -76,6 +76,51 @@ impl VarInt {
         } else {
             unreachable!()
         }
+    }
+}
+
+impl From<VarInt> for u64 {
+    fn from(x: VarInt) -> u64 {
+        x.0
+    }
+}
+
+impl From<u8> for VarInt {
+    fn from(x: u8) -> Self {
+        VarInt(x.into())
+    }
+}
+
+impl From<u16> for VarInt {
+    fn from(x: u16) -> Self {
+        VarInt(x.into())
+    }
+}
+
+impl From<u32> for VarInt {
+    fn from(x: u32) -> Self {
+        VarInt(x.into())
+    }
+}
+
+impl TryFrom<u64> for VarInt {
+    type Error = VarIntExceeded;
+    fn try_from(x: u64) -> Result<Self, Self::Error> {
+        VarInt::from_u64(x)
+    }
+}
+
+impl TryFrom<u128> for VarInt {
+    type Error = VarIntExceeded;
+    fn try_from(x: u128) -> Result<Self, Self::Error> {
+        VarInt::from_u64(x.try_into().map_err(|_| VarIntExceeded)?)
+    }
+}
+
+impl TryFrom<usize> for VarInt {
+    type Error = VarIntExceeded;
+    fn try_from(x: usize) -> Result<Self, Self::Error> {
+        VarInt::try_from(x as u64)
     }
 }
 
