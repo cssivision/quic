@@ -16,11 +16,12 @@ pub enum StreamType {
 impl StreamId {
     /// Create a new StreamId
     pub fn new(st: StreamType, id: u64) -> Self {
+        use StreamType::*;
         let bits = match st {
-            StreamType::ClientBidirectional => 0x00,
-            StreamType::ServerBidirectional => 0x01,
-            StreamType::ClientUnidirectional => 0x02,
-            StreamType::ServerUnidirectional => 0x03,
+            ClientBidirectional => 0x00,
+            ServerBidirectional => 0x01,
+            ClientUnidirectional => 0x02,
+            ServerUnidirectional => 0x03,
         };
         StreamId(id << 2 | bits)
     }
@@ -30,14 +31,15 @@ impl StreamId {
     }
 
     pub fn stream_type(&self) -> StreamType {
+        use StreamType::*;
         if self.0 & 0x2 == 0x00 {
-            StreamType::ClientBidirectional
+            ClientBidirectional
         } else if self.0 & 0x2 == 0x01 {
-            StreamType::ServerBidirectional
+            ServerBidirectional
         } else if self.0 & 0x2 == 0x02 {
-            StreamType::ClientUnidirectional
+            ClientUnidirectional
         } else if self.0 & 0x2 == 0x03 {
-            StreamType::ServerUnidirectional
+            ServerUnidirectional
         } else {
             unreachable!()
         }
@@ -58,11 +60,12 @@ impl From<VarInt> for StreamId {
 
 impl fmt::Display for StreamId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use StreamType::*;
         let s = match self.stream_type() {
-            StreamType::ClientBidirectional => "client bidirectional",
-            StreamType::ServerBidirectional => "server bidirectional",
-            StreamType::ClientUnidirectional => "client unidirectional",
-            StreamType::ServerUnidirectional => "server unidirectional",
+            ClientBidirectional => "client bidirectional",
+            ServerBidirectional => "server bidirectional",
+            ClientUnidirectional => "client unidirectional",
+            ServerUnidirectional => "server unidirectional",
         };
         write!(f, "{} stream {}", s, self.id())
     }

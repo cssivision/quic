@@ -1,5 +1,7 @@
 use std::convert::{TryFrom, TryInto};
 
+use bytes::{Buf, BufMut};
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
 pub struct VarInt(pub(crate) u64);
 
@@ -16,7 +18,7 @@ impl VarInt {
         }
     }
 
-    pub fn len(self) -> usize {
+    pub fn size(self) -> usize {
         let x = self.0;
         if x < 2u64.pow(6) {
             1
@@ -31,35 +33,35 @@ impl VarInt {
         }
     }
 
-    pub fn decode(b: &[u8]) -> Result<VarInt, VarIntUnexpectedEof> {
-        if b.is_empty() {
+    pub fn decode<B: Buf>(b: &mut B) -> Result<VarInt, VarIntUnexpectedEof> {
+        if !b.has_remaining() {
             return Err(VarIntUnexpectedEof);
         }
         let mut buf = [0; 8];
-        let t = b[0] >> 6;
-        buf[0] = b[0];
+        buf[0] = b.get_u8();
+        let t = buf[0] >> 6;
         buf[0] &= 0b0011_1111;
         let x = match t {
             0b00 => u64::from(buf[0]),
             0b01 => {
-                if b.len() < 2 {
+                if b.remaining() < 1 {
                     return Err(VarIntUnexpectedEof);
                 }
-                buf.copy_from_slice(&b[1..2]);
+                b.copy_to_slice(&mut buf[1..2]);
                 u64::from(u16::from_be_bytes(buf[..2].try_into().unwrap()))
             }
             0b10 => {
-                if b.len() < 4 {
+                if b.remaining() < 3 {
                     return Err(VarIntUnexpectedEof);
                 }
-                buf.copy_from_slice(&b[1..4]);
+                b.copy_to_slice(&mut buf[1..4]);
                 u64::from(u32::from_be_bytes(buf[..4].try_into().unwrap()))
             }
             0b11 => {
-                if b.len() < 8 {
+                if b.remaining() < 7 {
                     return Err(VarIntUnexpectedEof);
                 }
-                buf.copy_from_slice(&b[1..8]);
+                b.copy_to_slice(&mut buf[1..8]);
                 u64::from_be_bytes(buf)
             }
             _ => unreachable!(),
@@ -67,16 +69,16 @@ impl VarInt {
         Ok(VarInt(x))
     }
 
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode<B: BufMut>(&self, buf: &mut B) {
         let x = self.0;
         if x < 2u64.pow(6) {
-            (x as u8).to_be_bytes().to_vec()
+            buf.put_u8(x as u8);
         } else if x < 2u64.pow(14) {
-            (0b01 << 14 | x as u16).to_be_bytes().to_vec()
+            buf.put_u16(0b01 << 14 | x as u16);
         } else if x < 2u64.pow(30) {
-            (0b10 << 30 | x as u32).to_be_bytes().to_vec()
+            buf.put_u32(0b10 << 30 | x as u32);
         } else if x < 2u64.pow(62) {
-            (0b11 << 62 | x).to_be_bytes().to_vec()
+            buf.put_u64(0b11 << 62 | x);
         } else {
             unreachable!()
         }
