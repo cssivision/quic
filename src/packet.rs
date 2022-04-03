@@ -225,16 +225,6 @@ impl PacketNumber {
             candidate
         }
     }
-
-    fn plus_one(self) -> u8 {
-        use self::PacketNumber::*;
-        match self {
-            U8(_) => 0b00,
-            U16(_) => 0b01,
-            U24(_) => 0b10,
-            U32(_) => 0b11,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -326,7 +316,7 @@ impl Header {
                 number,
                 version,
             } => {
-                w.put_u8(u8::from(LongHeaderType::Initial) | number.tag());
+                w.put_u8(u8::from(LongHeaderType::Initial) | (number.len() - 1));
                 w.put_u32(version);
                 dst_cid.encode(w);
                 src_cid.encode(w);
