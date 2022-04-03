@@ -3,9 +3,12 @@ use std::fmt;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use thiserror::Error;
 
-const LONG_HEADER_FORM: u8 = 0b1000_0000;
-const LONG_HEADER_FIXED_BIT: u8 = 0b0100_0000;
-const LONG_RESERVED_BITS: u8 = 0x0c;
+use crate::crypto;
+use crate::varint::VarInt;
+
+const LONG_HEADER_FORM: u8 = 0x80;
+const LONG_HEADER_FIXED_BIT: u8 = 0x40;
+const LONG_HEADER_RESERVED_BITS: u8 = 0x0c;
 const MAX_CONNECTION_ID_LENGTH: usize = 20;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -90,7 +93,7 @@ impl fmt::Display for ConnectionId {
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub(crate) enum PacketNumber {
+pub enum PacketNumber {
     U8(u8),
     U16(u16),
     U24(u32),
@@ -222,27 +225,124 @@ impl PacketNumber {
             candidate
         }
     }
+
+    fn plus_one(self) -> u8 {
+        use self::PacketNumber::*;
+        match self {
+            U8(_) => 0b00,
+            U16(_) => 0b01,
+            U24(_) => 0b10,
+            U32(_) => 0b11,
+        }
+    }
 }
 
+#[derive(Debug)]
 pub struct Packet {
     header: Header,
     version: u32,
-    dst_cid: ConnectionId,
-    src_cid: ConnectionId,
-    number: PacketNumber,
     payload: BytesMut,
 }
 
 #[derive(Debug, Clone)]
 pub enum Header {
     Initial {
+        number: PacketNumber,
+        version: u32,
+        dst_cid: ConnectionId,
+        src_cid: ConnectionId,
         token: Bytes,
     },
-    ZeroRTT,
-    Handshake,
+    ZeroRTT {
+        number: PacketNumber,
+        version: u32,
+        dst_cid: ConnectionId,
+        src_cid: ConnectionId,
+    },
+    Handshake {
+        number: PacketNumber,
+        version: u32,
+        dst_cid: ConnectionId,
+        src_cid: ConnectionId,
+    },
     Retry {
-        token: Bytes,
-        integrity_tag: [u8; 128],
+        version: u32,
+        dst_cid: ConnectionId,
+        src_cid: ConnectionId,
     },
     VersionNegotiate,
+}
+
+pub(crate) struct PartialEncode {
+    pub start: usize,
+    pub header_len: usize,
+    // Packet number length, payload length needed
+    pn: Option<(usize, bool)>,
+}
+
+impl PartialEncode {
+    pub(crate) fn encode(
+        self,
+        buf: &mut [u8],
+        header_crypto: &dyn crypto::HeaderKey,
+        crypto: Option<(u64, &dyn crypto::PacketKey)>,
+    ) {
+        let PartialEncode { header_len, pn, .. } = self;
+        let (pn_len, write_len) = match pn {
+            Some((pn_len, write_len)) => (pn_len, write_len),
+            None => return,
+        };
+
+        let pn_pos = header_len - pn_len;
+        if write_len {
+            let len = buf.len() - header_len + pn_len;
+            assert!(len < 2usize.pow(14)); // Fits in reserved space
+            let mut slice = &mut buf[pn_pos - 2..pn_pos];
+            slice.put_u16(len as u16 | 0b01 << 14);
+        }
+
+        if let Some((number, crypto)) = crypto {
+            crypto.encrypt(number, buf, header_len);
+        }
+
+        debug_assert!(
+            pn_pos + 4 + header_crypto.sample_size() <= buf.len(),
+            "packet must be padded to at least {} bytes for header protection sampling",
+            pn_pos + 4 + header_crypto.sample_size()
+        );
+        header_crypto.encrypt(pn_pos, buf);
+    }
+}
+
+impl Header {
+    pub(crate) fn encode(&self, w: &mut Vec<u8>) -> PartialEncode {
+        use Header::*;
+        let start = w.len();
+        match *self {
+            Initial {
+                ref dst_cid,
+                ref src_cid,
+                ref token,
+                number,
+                version,
+            } => {
+                w.put_u8(u8::from(LongHeaderType::Initial) | number.tag());
+                w.put_u32(version);
+                dst_cid.encode(w);
+                src_cid.encode(w);
+                VarInt::from_u64(token.len() as u64).unwrap().encode(w);
+                w.put_slice(token);
+                w.put_u16(0); // Placeholder for payload length
+                number.encode(w);
+                PartialEncode {
+                    start,
+                    header_len: w.len() - start,
+                    pn: Some((number.len(), true)),
+                }
+            }
+            _ => {
+                unimplemented!()
+            }
+        }
+    }
 }
