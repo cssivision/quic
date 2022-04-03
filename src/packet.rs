@@ -316,7 +316,7 @@ impl Header {
                 number,
                 version,
             } => {
-                w.put_u8(u8::from(LongHeaderType::Initial) | (number.len() - 1));
+                w.put_u8(u8::from(LongHeaderType::Initial) | (number.len() as u8 - 1));
                 w.put_u32(version);
                 dst_cid.encode(w);
                 src_cid.encode(w);

@@ -7,3 +7,4 @@ edition = "2018"
 [dependencies]
 bytes = "1"
 thiserror = "1"
+rustls = { version = "0.20", features = ["quic"] }
