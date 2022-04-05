@@ -34,17 +34,33 @@ pub struct CryptoError;
 impl HeaderKey for rustls::quic::HeaderProtectionKey {
     /// Decrypt the given packet's header
     fn decrypt(&self, pn_offset: usize, packet: &mut [u8]) {
-        unimplemented!()
+        let (header, sample) = packet.split_at_mut(pn_offset + 4);
+        let (first, rest) = header.split_at_mut(1);
+        let pn_end = Ord::min(pn_offset + 3, rest.len());
+        self.decrypt_in_place(
+            &sample[..self.sample_size()],
+            &mut first[0],
+            &mut rest[pn_offset - 1..pn_end],
+        )
+        .unwrap();
     }
 
     /// Encrypt the given packet's header
     fn encrypt(&self, pn_offset: usize, packet: &mut [u8]) {
-        unimplemented!()
+        let (header, sample) = packet.split_at_mut(pn_offset + 4);
+        let (first, rest) = header.split_at_mut(1);
+        let pn_end = Ord::min(pn_offset + 3, rest.len());
+        self.encrypt_in_place(
+            &sample[..self.sample_size()],
+            &mut first[0],
+            &mut rest[pn_offset - 1..pn_end],
+        )
+        .unwrap();
     }
 
     /// The sample size used for this key's algorithm
     fn sample_size(&self) -> usize {
-        unimplemented!()
+        self.sample_len()
     }
 }
 
@@ -64,22 +80,27 @@ impl PacketKey for rustls::quic::PacketKey {
         header: &[u8],
         payload: &mut BytesMut,
     ) -> Result<(), CryptoError> {
-        unimplemented!()
+        let plain = self
+            .decrypt_in_place(packet, header, payload.as_mut())
+            .map_err(|_| CryptoError)?;
+        let plain_len = plain.len();
+        payload.truncate(plain_len);
+        Ok(())
     }
 
     /// The length of the AEAD tag appended to packets on encryption
     fn tag_len(&self) -> usize {
-        unimplemented!()
+        self.tag_len()
     }
 
     /// Maximum number of packets that may be sent using a single key
     fn confidentiality_limit(&self) -> u64 {
-        unimplemented!()
+        self.confidentiality_limit()
     }
 
     /// Maximum number of incoming packets that may fail decryption before the connection must be
     /// abandoned
     fn integrity_limit(&self) -> u64 {
-        unimplemented!()
+        self.integrity_limit()
     }
 }

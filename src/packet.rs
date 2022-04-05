@@ -9,6 +9,11 @@ use crate::varint::VarInt;
 const LONG_HEADER_FORM: u8 = 0x80;
 const LONG_HEADER_FIXED_BIT: u8 = 0x40;
 const LONG_HEADER_RESERVED_BITS: u8 = 0x0c;
+
+const SHORT_HEADER_FIXED_BIT: u8 = 0x40;
+const SHORT_HEADER_SPIN_BIT: u8 = 0x20;
+const SHORT_HEADER_KEY_PHASE_BIT: u8 = 0x04;
+
 const MAX_CONNECTION_ID_LENGTH: usize = 20;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,6 +42,13 @@ pub struct ConnectionId {
     length: u8,
     /// bytes of ConnectionId
     data: [u8; MAX_CONNECTION_ID_LENGTH],
+}
+
+impl std::ops::Deref for ConnectionId {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.data[0..self.length as usize]
+    }
 }
 
 impl ConnectionId {
@@ -230,8 +242,8 @@ impl PacketNumber {
 #[derive(Debug)]
 pub struct Packet {
     header: Header,
-    version: u32,
-    payload: BytesMut,
+    pub(crate) header_data: Bytes,
+    pub(crate) payload: BytesMut,
 }
 
 #[derive(Debug, Clone)]
@@ -260,7 +272,17 @@ pub enum Header {
         dst_cid: ConnectionId,
         src_cid: ConnectionId,
     },
-    VersionNegotiate,
+    VersionNegotiate {
+        random: u8,
+        src_cid: ConnectionId,
+        dst_cid: ConnectionId,
+    },
+    Short {
+        spin: bool,
+        key_phase: bool,
+        dst_cid: ConnectionId,
+        number: PacketNumber,
+    },
 }
 
 pub(crate) struct PartialEncode {
@@ -330,8 +352,95 @@ impl Header {
                     pn: Some((number.len(), true)),
                 }
             }
-            _ => {
-                unimplemented!()
+            Handshake {
+                ref dst_cid,
+                ref src_cid,
+                number,
+                version,
+            } => {
+                w.put_u8(u8::from(LongHeaderType::Handshake) | (number.len() as u8 - 1));
+                w.put_u32(version);
+                dst_cid.encode(w);
+                src_cid.encode(w);
+                w.put_u16(0); // Placeholder for payload length
+                number.encode(w);
+                PartialEncode {
+                    start,
+                    header_len: w.len() - start,
+                    pn: Some((number.len(), true)),
+                }
+            }
+            ZeroRTT {
+                ref dst_cid,
+                ref src_cid,
+                number,
+                version,
+            } => {
+                w.put_u8(u8::from(LongHeaderType::ZeroRTT) | (number.len() as u8 - 1));
+                w.put_u32(version);
+                dst_cid.encode(w);
+                src_cid.encode(w);
+                w.put_u16(0); // Placeholder for payload length
+                number.encode(w);
+                PartialEncode {
+                    start,
+                    header_len: w.len() - start,
+                    pn: Some((number.len(), true)),
+                }
+            }
+            Retry {
+                ref dst_cid,
+                ref src_cid,
+                version,
+            } => {
+                w.put_u8(u8::from(LongHeaderType::Retry));
+                w.put_u32(version);
+                dst_cid.encode(w);
+                src_cid.encode(w);
+                PartialEncode {
+                    start,
+                    header_len: w.len() - start,
+                    pn: None,
+                }
+            }
+            VersionNegotiate {
+                random,
+                ref dst_cid,
+                ref src_cid,
+            } => {
+                w.put_u8(0x80u8 | random);
+                w.put_u32(0);
+                dst_cid.encode(w);
+                src_cid.encode(w);
+                PartialEncode {
+                    start,
+                    header_len: w.len() - start,
+                    pn: None,
+                }
+            }
+            Short {
+                spin,
+                key_phase,
+                ref dst_cid,
+                number,
+            } => {
+                w.put_u8(
+                    SHORT_HEADER_FIXED_BIT
+                        | if key_phase {
+                            SHORT_HEADER_KEY_PHASE_BIT
+                        } else {
+                            0
+                        }
+                        | if spin { SHORT_HEADER_SPIN_BIT } else { 0 }
+                        | (number.len() as u8 - 1),
+                );
+                w.put_slice(dst_cid);
+                number.encode(w);
+                PartialEncode {
+                    start,
+                    header_len: w.len() - start,
+                    pn: Some((number.len(), false)),
+                }
             }
         }
     }
