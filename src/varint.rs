@@ -2,6 +2,14 @@ use std::convert::{TryFrom, TryInto};
 
 use bytes::{Buf, BufMut};
 
+pub(crate) fn encode<B: BufMut>(x: u64, buf: &mut B) {
+    unsafe { VarInt::from_u64_unchecked(x).encode(buf) };
+}
+
+pub(crate) fn decode<B: Buf>(b: &mut B) -> Result<VarInt, VarIntUnexpectedEof> {
+    VarInt::decode(b)
+}
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
 pub struct VarInt(pub(crate) u64);
 

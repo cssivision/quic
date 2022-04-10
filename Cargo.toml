@@ -8,3 +8,4 @@ edition = "2018"
 bytes = "1"
 thiserror = "1"
 rustls = { version = "0.20", features = ["quic"] }
+tinyvec = { version = "1.5", features = ["alloc"] }
